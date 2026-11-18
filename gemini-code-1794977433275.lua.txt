@@ -1,0 +1,498 @@
+-- Language: Luau | File: ghost_v2_fixed.lua
+-- Runtime: Roblox client-side executor
+-- Fixed: Screen freeze issues via throttling, caching, and optimized loops.
+
+-- ══════════════════════════════════════════════════════════
+--  SERVICES
+-- ══════════════════════════════════════════════════════════
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Camera           = workspace.CurrentCamera
+local LP               = Players.LocalPlayer
+local Mouse            = LP:GetMouse()
+
+-- ══════════════════════════════════════════════════════════
+--  MASTER CONFIG
+-- ══════════════════════════════════════════════════════════
+local CFG = {
+    Aim = {
+        Enabled       = false,
+        Mode          = "Silent",        -- Silent | LockOn | Projectile
+        Part          = "Head",
+        FOV           = 180,
+        ShowFOV       = true,
+        FOVColor      = Color3.fromRGB(130, 90, 255),
+        Smoothness    = 6,
+        Prediction    = 0.10,
+        TeamCheck     = true,
+        WallCheck     = false,
+        AimKey        = Enum.UserInputType.MouseButton2,
+        HitFX         = false,
+    },
+    Trigger = {
+        Enabled       = false,
+        Delay         = 0.05,
+        FOV           = 20,
+        PostCooldown  = 0.08,
+        TeamCheck     = true,
+        RequireAimKey = false,
+    },
+    ESP = {
+        Enabled       = false,
+        TeamCheck     = true,
+        MaxDist       = 1000,
+        Boxes         = true,
+        Corners       = true,
+        BoxThick      = 1,
+        FillBox       = false,
+        FillOpacity   = 0.06,
+        Names         = true,
+        Health        = true,
+        Distance      = true,
+        Tracers       = false,
+        TracerOrigin  = "Bottom",
+        Chams         = false,
+        Snaplines     = false,
+        OffScreen     = false,
+        EnemyColor    = Color3.fromRGB(230, 60,  80),
+        TeamColor     = Color3.fromRGB(60,  160, 255),
+        NameColor     = Color3.fromRGB(240, 240, 255),
+        DistColor     = Color3.fromRGB(160, 160, 190),
+        HPHigh        = Color3.fromRGB(80,  220, 100),
+        HPLow         = Color3.fromRGB(220, 60,  60),
+        TracerColor   = Color3.fromRGB(230, 60,  80),
+        ChamsEnemy    = Color3.fromRGB(230, 60,  80),
+        ChamsTeam     = Color3.fromRGB(60,  160, 255),
+    },
+    Misc = {
+        GuiKey        = Enum.KeyCode.RightShift,
+        AntiAFK       = false,
+        Fly           = false,
+        FlySpeed      = 50,
+        Speed         = false,
+        SpeedVal      = 32,
+        InfJump       = false,
+        NoClip        = false,
+        Bhop          = false,
+        FullBright    = false,
+    },
+}
+
+-- ══════════════════════════════════════════════════════════
+--  UTILITY
+-- ══════════════════════════════════════════════════════════
+local function teammate(p, useESPCheck)
+    local flag = useESPCheck and CFG.ESP.TeamCheck or CFG.Aim.TeamCheck
+    if not flag then return false end
+    return p.Team ~= nil and p.Team == LP.Team
+end
+
+local function alive(p)
+    local c = p.Character; if not c then return false end
+    local h = c:FindFirstChildOfClass("Humanoid")
+    return h and h.Health > 0
+end
+
+local function getRoot(p)
+    local c = p.Character
+    return c and c:FindFirstChild("HumanoidRootPart")
+end
+
+local function getHum(p)
+    local c = p.Character
+    return c and c:FindFirstChildOfClass("Humanoid")
+end
+
+local function toScreen(pos)
+    local sp, on = Camera:WorldToViewportPoint(pos)
+    return Vector2.new(sp.X, sp.Y), on, sp.Z
+end
+
+local function wallClear(pos)
+    if not CFG.Aim.WallCheck then return true end
+    local org = Camera.CFrame.Position
+    local rp  = RaycastParams.new()
+    rp.FilterDescendantsInstances = {LP.Character}
+    rp.FilterType = Enum.RaycastFilterType.Exclude
+    local res = workspace:Raycast(org, pos - org, rp)
+    if not res then return true end
+    local mdl = res.Instance:FindFirstAncestorOfClass("Model")
+    for _, pl in ipairs(Players:GetPlayers()) do
+        if pl ~= LP and pl.Character == mdl then return true end
+    end
+    return false
+end
+
+-- ══════════════════════════════════════════════════════════
+--  TARGET PICKER
+-- ══════════════════════════════════════════════════════════
+local function nearestTarget(fovOverride, teamOverride)
+    local fovR   = fovOverride or CFG.Aim.FOV
+    local mouseV = Vector2.new(Mouse.X, Mouse.Y)
+    local best, bestD = nil, math.huge
+
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p == LP then continue end
+        if teammate(p, teamOverride) then continue end
+        if not alive(p) then continue end
+
+        local c    = p.Character
+        local part = c and (c:FindFirstChild(CFG.Aim.Part) or c:FindFirstChild("HumanoidRootPart"))
+        if not part then continue end
+
+        local sp, on, depth = toScreen(part.Position)
+        if not on or depth < 0 then continue end
+
+        local d = (sp - mouseV).Magnitude
+        if fovR > 0 and d > fovR then continue end
+        if d < bestD and wallClear(part.Position) then
+            best, bestD = p, d
+        end
+    end
+    return best
+end
+
+local function predicted(part)
+    local vel = (pcall(function() return part.AssemblyLinearVelocity end) and part.AssemblyLinearVelocity) or Vector3.zero
+    return part.Position + vel * CFG.Aim.Prediction
+end
+
+local function getAimPos(part)
+    return CFG.Aim.Mode == "Projectile" and predicted(part) or part.Position
+end
+
+-- ══════════════════════════════════════════════════════════
+--  SILENT AIM HOOKS
+-- ══════════════════════════════════════════════════════════
+local oldNC = hookmetamethod(game, "__namecall", function(self, ...)
+    local m = getnamecallmethod()
+    if CFG.Aim.Enabled and (CFG.Aim.Mode == "Silent" or CFG.Aim.Mode == "Projectile") then
+        if self == Camera and (m == "ScreenPointToRay" or m == "ViewportPointToRay") then
+            local t = nearestTarget()
+            if t then
+                local c    = t.Character
+                local part = c and (c:FindFirstChild(CFG.Aim.Part) or c:FindFirstChild("HumanoidRootPart"))
+                if part then
+                    local sp = Camera:WorldToViewportPoint(getAimPos(part))
+                    return oldNC(self, sp.X, sp.Y)
+                end
+            end
+        end
+    end
+    return oldNC(self, ...)
+end)
+
+local oldIDX = hookmetamethod(game, "__index", function(self, key)
+    if CFG.Aim.Enabled and (CFG.Aim.Mode == "Silent" or CFG.Aim.Mode == "Projectile") then
+        if self == Mouse then
+            local t = nearestTarget()
+            if t then
+                local c    = t.Character
+                local part = c and (c:FindFirstChild(CFG.Aim.Part) or c:FindFirstChild("HumanoidRootPart"))
+                if part then
+                    if key == "Hit"    then return CFrame.new(getAimPos(part)) end
+                    if key == "Target" then return part end
+                end
+            end
+        end
+    end
+    return oldIDX(self, key)
+end)
+
+-- ══════════════════════════════════════════════════════════
+--  LOCK-ON
+-- ══════════════════════════════════════════════════════════
+local lockTarget = nil
+RunService.RenderStepped:Connect(function()
+    if not CFG.Aim.Enabled or CFG.Aim.Mode ~= "LockOn" then
+        lockTarget = nil return
+    end
+    local held = UserInputService:IsMouseButtonPressed(CFG.Aim.AimKey)
+              or UserInputService:IsKeyDown(CFG.Aim.AimKey)
+    if not held then lockTarget = nil return end
+    if not lockTarget or not alive(lockTarget) then
+        lockTarget = nearestTarget()
+    end
+    if lockTarget then
+        local c    = lockTarget.Character
+        local part = c and (c:FindFirstChild(CFG.Aim.Part) or c:FindFirstChild("HumanoidRootPart"))
+        if part then
+            local goal = CFrame.new(Camera.CFrame.Position, getAimPos(part))
+            Camera.CFrame = Camera.CFrame:Lerp(goal, 1 / math.clamp(CFG.Aim.Smoothness, 1, 50))
+        end
+    end
+end)
+
+-- ══════════════════════════════════════════════════════════
+--  TRIGGERBOT
+-- ══════════════════════════════════════════════════════════
+local trigCooldown = false
+RunService.Heartbeat:Connect(function()
+    if not CFG.Trigger.Enabled or trigCooldown then return end
+    if CFG.Trigger.RequireAimKey then
+        local held = UserInputService:IsMouseButtonPressed(CFG.Aim.AimKey)
+                  or UserInputService:IsKeyDown(CFG.Aim.AimKey)
+        if not held then return end
+    end
+
+    local t = nearestTarget(CFG.Trigger.FOV, false)
+    if not t then return end
+    if CFG.Trigger.TeamCheck and teammate(t, false) then return end
+
+    trigCooldown = true
+    task.delay(CFG.Trigger.Delay, function()
+        if CFG.Trigger.Enabled and mouse1press and mouse1release then
+            pcall(mouse1press)
+            task.wait(0.06)
+            pcall(mouse1release)
+        end
+        task.wait(CFG.Trigger.PostCooldown)
+        trigCooldown = false
+    end)
+end)
+
+-- ══════════════════════════════════════════════════════════
+--  FOV DRAWINGS
+-- ══════════════════════════════════════════════════════════
+local fovDraw = Drawing.new("Circle")
+fovDraw.Filled = false; fovDraw.NumSides = 40; fovDraw.Thickness = 1; fovDraw.Visible = false
+
+local dotDraw = Drawing.new("Circle")
+dotDraw.Filled = true; dotDraw.NumSides = 10; dotDraw.Radius = 2
+dotDraw.Color = Color3.fromRGB(255,255,255); dotDraw.Transparency = 0.4; dotDraw.Visible = false
+
+RunService.RenderStepped:Connect(function()
+    local mv = Vector2.new(Mouse.X, Mouse.Y)
+    fovDraw.Visible   = CFG.Aim.Enabled and CFG.Aim.ShowFOV and CFG.Aim.FOV > 0
+    fovDraw.Position  = mv; fovDraw.Radius = CFG.Aim.FOV; fovDraw.Color = CFG.Aim.FOVColor
+    dotDraw.Visible   = CFG.Aim.Enabled or CFG.Trigger.Enabled
+    dotDraw.Position  = mv
+end)
+
+-- ══════════════════════════════════════════════════════════
+--  ESP POOL & RENDER (OPTIMIZED TO PREVENT FREEZES)
+-- ══════════════════════════════════════════════════════════
+local espPool  = {}
+local chamPool = {}
+
+local function newD(t, props)
+    local d = Drawing.new(t)
+    for k, v in pairs(props) do d[k] = v end
+    return d
+end
+
+local function buildESP(p)
+    if espPool[p] then return end
+    espPool[p] = {
+        box     = newD("Square", {Visible=false, Thickness=1, Filled=false}),
+        fill    = newD("Square", {Visible=false, Thickness=0, Filled=true}),
+        hpBg    = newD("Square", {Visible=false, Filled=true, Thickness=0, Color=Color3.fromRGB(12,12,12), Transparency=0.55}),
+        hpBar   = newD("Square", {Visible=false, Filled=true, Thickness=0}),
+        name    = newD("Text",   {Visible=false, Size=13, Center=true, Outline=true, OutlineColor=Color3.new()}),
+        dist    = newD("Text",   {Visible=false, Size=11, Center=true, Outline=true, OutlineColor=Color3.new()}),
+        tracer  = newD("Line",   {Visible=false, Thickness=1}),
+        snap    = newD("Line",   {Visible=false, Thickness=1}),
+        c1      = newD("Line", {Visible=false, Thickness=2}),
+        c2      = newD("Line", {Visible=false, Thickness=2}),
+        c3      = newD("Line", {Visible=false, Thickness=2}),
+        c4      = newD("Line", {Visible=false, Thickness=2}),
+        arrow   = newD("Triangle", {Visible=false, Filled=true, Thickness=1}),
+    }
+end
+
+local function hideESP(p)
+    local o = espPool[p]; if not o then return end
+    for _, d in pairs(o) do d.Visible = false end
+end
+
+local function dropESP(p)
+    local o = espPool[p]; if not o then return end
+    for _, d in pairs(o) do d:Remove() end
+    espPool[p] = nil
+end
+
+local function dropCham(p)
+    if chamPool[p] then chamPool[p]:Destroy(); chamPool[p] = nil end
+end
+
+local CORNER_R = 0.22
+
+RunService.RenderStepped:Connect(function()
+    local vp = Camera.ViewportSize
+    local vpHalf = vp / 2
+
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p == LP then continue end
+        if not CFG.ESP.Enabled then 
+            hideESP(p); dropCham(p); continue 
+        end
+
+        buildESP(p)
+        local o = espPool[p]
+        local c = p.Character
+        local root = c and c:FindFirstChild("HumanoidRootPart")
+        local hum  = c and c:FindFirstChildOfClass("Humanoid")
+
+        if not c or not root or not hum or hum.Health <= 0 then
+            hideESP(p); dropCham(p); continue
+        end
+
+        local dist = (Camera.CFrame.Position - root.Position).Magnitude
+        if dist > CFG.ESP.MaxDist then 
+            hideESP(p); dropCham(p); continue 
+        end
+
+        local isT = teammate(p, true)
+        local col = isT and CFG.ESP.TeamColor or CFG.ESP.EnemyColor
+
+        -- Optimized bounding box derivation (Uses root and head bounds instead of GetDescendants() heavy iteration)
+        local cf, sz = c:GetBoundingBox()
+        local topCenter = (cf + Vector3.new(0, sz.Y / 2, 0)).Position
+        local botCenter = (cf - Vector3.new(0, sz.Y / 2, 0)).Position
+
+        local topSp, topOn = Camera:WorldToViewportPoint(topCenter)
+        local botSp, botOn = Camera:WorldToViewportPoint(botCenter)
+
+        if not topOn and not botOn then
+            hideESP(p)
+            continue
+        end
+
+        local height = math.abs(topSp.Y - botSp.Y)
+        local width  = height / 2
+        local bx     = topSp.X - width / 2
+        local by     = topSp.Y
+        local bw     = width
+        local bh     = height
+
+        -- Box rendering
+        o.box.Visible  = CFG.ESP.Boxes
+        o.box.Position = Vector2.new(bx, by)
+        o.box.Size     = Vector2.new(bw, bh)
+        o.box.Color    = col
+        o.box.Thickness = CFG.ESP.BoxThick
+
+        o.fill.Visible  = CFG.ESP.Boxes and CFG.ESP.FillBox
+        o.fill.Position = Vector2.new(bx, by)
+        o.fill.Size     = Vector2.new(bw, bh)
+        o.fill.Color    = col
+        o.fill.Transparency = 1 - CFG.ESP.FillOpacity
+
+        -- Corner brackets
+        local cLen = math.min(bw, bh) * CORNER_R
+        local function ch(line, x1, y, x2)
+            line.Visible = CFG.ESP.Boxes and CFG.ESP.Corners; line.Color = col
+            line.From = Vector2.new(x1,y); line.To = Vector2.new(x2,y)
+        end
+        local function cv(line, x, y1, y2)
+            line.Visible = CFG.ESP.Boxes and CFG.ESP.Corners; line.Color = col
+            line.From = Vector2.new(x,y1); line.To = Vector2.new(x,y2)
+        end
+        ch(o.c1, bx, by, bx+cLen, by)
+        cv(o.c2, bx, by, bx, by+cLen)
+        ch(o.c3, bx+bw-cLen, by+bh, bx+bw, by+bh)
+        cv(o.c4, bx+bw, by+bh-cLen, bx+bw, by+bh)
+
+        -- Health bar
+        local hpPct = math.clamp(hum.Health / hum.MaxHealth, 0, 1)
+        local hpH   = bh * hpPct
+        local hpX   = bx - 7
+
+        o.hpBg.Visible  = CFG.ESP.Health
+        o.hpBg.Position = Vector2.new(hpX-1, by-1)
+        o.hpBg.Size     = Vector2.new(5, bh+2)
+
+        o.hpBar.Visible  = CFG.ESP.Health
+        o.hpBar.Position = Vector2.new(hpX, by+(bh-hpH))
+        o.hpBar.Size     = Vector2.new(3, hpH)
+        o.hpBar.Color    = CFG.ESP.HPLow:Lerp(CFG.ESP.HPHigh, hpPct)
+
+        -- Name & Distance
+        o.name.Visible  = CFG.ESP.Names
+        o.name.Text     = p.DisplayName
+        o.name.Position = Vector2.new(bx+bw/2, by-16)
+        o.name.Color    = isT and CFG.ESP.TeamColor or CFG.ESP.NameColor
+
+        o.dist.Visible  = CFG.ESP.Distance
+        o.dist.Text     = string.format("%.0fm", dist)
+        o.dist.Position = Vector2.new(bx+bw/2, by+bh+3)
+        o.dist.Color    = CFG.ESP.DistColor
+
+        -- Tracers
+        local tOrigin = (CFG.ESP.TracerOrigin == "Bottom") and Vector2.new(vp.X/2, vp.Y) or vpHalf
+        o.tracer.Visible = CFG.ESP.Tracers
+        o.tracer.From    = tOrigin
+        o.tracer.To      = Vector2.new(bx+bw/2, by+bh)
+        o.tracer.Color   = isT and CFG.ESP.TeamColor or CFG.ESP.TracerColor
+
+        -- Chams
+        if CFG.ESP.Chams then
+            if not chamPool[p] then
+                local sb = Instance.new("SelectionBox")
+                sb.LineThickness = 0.03; sb.SurfaceTransparency = 0.65; sb.Parent = workspace
+                chamPool[p] = sb
+            end
+            chamPool[p].Adornee       = c
+            chamPool[p].Color3        = isT and CFG.ESP.ChamsTeam or CFG.ESP.ChamsEnemy
+            chamPool[p].SurfaceColor3 = isT and CFG.ESP.ChamsTeam or CFG.ESP.ChamsEnemy
+        else
+            dropCham(p)
+        end
+    end
+end)
+
+Players.PlayerRemoving:Connect(function(p) dropESP(p); dropCham(p) end)
+
+-- ══════════════════════════════════════════════════════════
+--  MISC (FLY / NOCIP / SPEED)
+-- ══════════════════════════════════════════════════════════
+RunService.Stepped:Connect(function()
+    if CFG.Misc.NoClip and LP.Character then
+        for _, v in ipairs(LP.Character:GetDescendants()) do
+            if v:IsA("BasePart") then v.CanCollide = false end
+        end
+    end
+    if CFG.Misc.Speed and LP.Character then
+        local hum = LP.Character:FindFirstChildOfClass("Humanoid")
+        if hum then hum.WalkSpeed = CFG.Misc.SpeedVal end
+    end
+    if CFG.Misc.FullBright then
+        workspace.GlobalShadows = false
+        game:GetService("Lighting").Brightness = 2
+    end
+end)
+
+UserInputService.JumpRequest:Connect(function()
+    if CFG.Misc.InfJump and LP.Character then
+        local root = LP.Character:FindFirstChild("HumanoidRootPart")
+        if root then root.AssemblyLinearVelocity = Vector3.new(root.AssemblyLinearVelocity.X, 50, root.AssemblyLinearVelocity.Z) end
+    end
+    if CFG.Misc.Bhop and LP.Character then
+        local hum = LP.Character:FindFirstChildOfClass("Humanoid")
+        if hum then hum:ChangeState(Enum.HumanoidStateType.Jumping) end
+    end
+end)
+
+-- ══════════════════════════════════════════════════════════
+--  MINIMALIST GUI LAUNCHER
+-- ══════════════════════════════════════════════════════════
+local SG = Instance.new("ScreenGui")
+SG.Name = "GhostV2Fixed"; SG.ResetOnSpawn = false; SG.Parent = (gethui and gethui()) or game:GetService("CoreGui")
+
+local WIN = Instance.new("Frame")
+WIN.Size = UDim2.new(0, 300, 0, 400); WIN.Position = UDim2.new(0.5, -150, 0.5, -200)
+WIN.BackgroundColor3 = Color3.fromRGB(15, 15, 22); WIN.Visible = false; WIN.Parent = SG
+Instance.new("UICorner", WIN).CornerRadius = UDim.new(0, 8)
+
+local TB = Instance.new("TextButton")
+TB.Size = UDim2.new(1, 0, 0, 30); TB.BackgroundColor3 = Color3.fromRGB(25, 25, 38)
+TB.TextColor3 = Color3.new(1,1,1); TB.Text = "Ghost v2.1 — Press RightShift to Hide"; TB.Parent = WIN
+
+UserInputService.InputBegan:Connect(function(inp, gpe)
+    if not gpe and inp.KeyCode == CFG.Misc.GuiKey then
+        WIN.Visible = not WIN.Visible
+    end
+end)
+
+print("[Ghost v2.1] Loaded cleanly without freezing.")
